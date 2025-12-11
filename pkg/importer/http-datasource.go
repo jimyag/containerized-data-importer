@@ -139,6 +139,13 @@ func (hs *HTTPDataSource) Info() (ProcessingPhase, error) {
 	if hs.contentType == cdiv1.DataVolumeArchive {
 		return ProcessingPhaseTransferDataDir, nil
 	}
+	// For compressed raw images (e.g., raw.zst, raw.gz, raw.xz), we can stream directly
+	// to the target without scratch space or qemu-img conversion.
+	// Archived=true means compressed, Convert=false means not qcow2/vmdk/vdi/vhd/vhdx
+	if hs.contentType == cdiv1.DataVolumeKubeVirt && hs.readers.Archived && !hs.readers.Convert {
+		klog.V(1).Infof("Detected compressed raw image, streaming directly to target")
+		return ProcessingPhaseTransferDataFile, nil
+	}
 	if pullMethod, _ := util.ParseEnvVar(common.ImporterPullMethod, false); pullMethod == string(cdiv1.RegistryPullNode) {
 		if err := hs.startNbdKit(); err != nil {
 			return ProcessingPhaseError, err
