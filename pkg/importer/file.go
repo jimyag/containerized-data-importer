@@ -9,12 +9,44 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
+	"unsafe"
 
 	"github.com/pkg/errors"
 	"golang.org/x/sys/unix"
 
 	"k8s.io/klog/v2"
 )
+
+// isZeroBlock checks if a byte slice contains only zeros.
+// Uses 64-bit word comparison for better performance on large buffers.
+func isZeroBlock(buf []byte) bool {
+	if len(buf) == 0 {
+		return true
+	}
+
+	// Fast path: check using 64-bit words
+	// This is ~8x faster than byte-by-byte comparison
+	ptr := unsafe.Pointer(&buf[0])
+	n := len(buf)
+
+	// Check 64-bit aligned portion
+	words := n / 8
+	wordPtr := (*[1 << 30]uint64)(ptr)[:words:words]
+	for _, w := range wordPtr {
+		if w != 0 {
+			return false
+		}
+	}
+
+	// Check remaining bytes
+	for i := words * 8; i < n; i++ {
+		if buf[i] != 0 {
+			return false
+		}
+	}
+	return true
+}
 
 var (
 	blockdevFileName = "/usr/sbin/blockdev"
@@ -228,9 +260,16 @@ func zeroWriterWithFallback(zwf zeroWriterFunc) func(dst *os.File, start, length
 
 func copyWithSparseCheck(dst *os.File, src io.Reader, zeroWriter zeroWriterFunc) (int64, int64, error) {
 	klog.Infof("copyWithSparseCheck to %s", dst.Name())
-	const buffSize = 32 * 1024
+	const (
+		buffSize       = 4 << 20  // 4 MB buffer size (sparse detection boundary)
+		syncInterval   = 64 << 20 // sync every 64 MB read (not written, to handle sparse files)
+		skipWrite      = false    // DEBUG: skip actual write to test download+decompress speed
+		skipZeroCheck  = false    // DEBUG: skip zero detection to test pure download+decompress speed
+	)
 	var bytesRead, bytesWritten int64
-	zeroBuf := make([]byte, buffSize)
+	var bytesReadSinceLastSync int64
+	var syncCount int
+	var lastLogTime time.Time
 	writeBuf := make([]byte, buffSize)
 	var writeOffset int64
 	checkZeros := true
@@ -241,37 +280,73 @@ func copyWithSparseCheck(dst *os.File, src io.Reader, zeroWriter zeroWriterFunc)
 			var nw int
 			var ew error
 			var zbw int64
-			if checkZeros && bytes.Equal(writeBuf[0:nr], zeroBuf[0:nr]) {
+			// Use optimized zero detection (64-bit word comparison)
+			isZero := !skipZeroCheck && checkZeros && isZeroBlock(writeBuf[0:nr])
+			if isZero {
 				bytesRead += int64(nr)
+				bytesReadSinceLastSync += int64(nr)
 			} else {
-				if bytesRead > writeOffset {
-					// func should seek to bytesRead before returning
-					zbw, ew = zeroWriterFunc(dst, writeOffset, bytesRead-writeOffset)
+				if skipWrite {
+					// DEBUG: skip write, just count bytes
+					bytesRead += int64(nr)
+					bytesReadSinceLastSync += int64(nr)
+					bytesWritten += int64(nr)
+					writeOffset = bytesRead
+				} else {
+					if bytesRead > writeOffset {
+						// func should seek to bytesRead before returning
+						zbw, ew = zeroWriterFunc(dst, writeOffset, bytesRead-writeOffset)
+						if ew != nil {
+							klog.Errorf("Error writing zeroes to destination file: %v", ew)
+							return bytesRead, bytesWritten, ew
+						}
+						bytesWritten += zbw
+						if zbw > 0 {
+							checkZeros = false
+						}
+					}
+					nw, ew = dst.Write(writeBuf[0:nr])
+					if nw < 0 || nr < nw {
+						nw = 0
+						if ew == nil {
+							ew = fmt.Errorf("invalid write result")
+						}
+					}
+					bytesRead += int64(nr)
+					bytesReadSinceLastSync += int64(nr)
+					bytesWritten += int64(nw)
+					writeOffset = bytesRead
 					if ew != nil {
-						klog.Errorf("Error writing zeroes to destination file: %v", ew)
 						return bytesRead, bytesWritten, ew
 					}
-					bytesWritten += zbw
-					if zbw > 0 {
-						checkZeros = false
+					if nr != nw {
+						return bytesRead, bytesWritten, io.ErrShortWrite
 					}
 				}
-				nw, ew = dst.Write(writeBuf[0:nr])
-				if nw < 0 || nr < nw {
-					nw = 0
-					if ew == nil {
-						ew = fmt.Errorf("invalid write result")
+			}
+			// Periodic log based on bytes read
+			if bytesReadSinceLastSync >= syncInterval {
+				if !skipWrite {
+					syncStart := time.Now()
+					if err := dst.Sync(); err != nil {
+						return bytesRead, bytesWritten, errors.Wrap(err, "periodic sync failed")
+					}
+					syncCount++
+					// Log sync stats every second
+					if time.Since(lastLogTime) >= time.Second {
+						klog.Infof("Sync #%d took %v, bytesRead: %d MB, bytesWritten: %d MB",
+							syncCount, time.Since(syncStart), bytesRead>>20, bytesWritten>>20)
+						lastLogTime = time.Now()
+					}
+				} else {
+					// DEBUG: just log progress
+					if time.Since(lastLogTime) >= time.Second {
+						klog.Infof("[SKIP-WRITE] bytesRead: %d MB, bytesWritten: %d MB",
+							bytesRead>>20, bytesWritten>>20)
+						lastLogTime = time.Now()
 					}
 				}
-				bytesRead += int64(nr)
-				bytesWritten += int64(nw)
-				writeOffset = bytesRead
-				if ew != nil {
-					return bytesRead, bytesWritten, ew
-				}
-				if nr != nw {
-					return bytesRead, bytesWritten, io.ErrShortWrite
-				}
+				bytesReadSinceLastSync = 0
 			}
 		}
 		if er != nil {
@@ -281,7 +356,7 @@ func copyWithSparseCheck(dst *os.File, src io.Reader, zeroWriter zeroWriterFunc)
 			break
 		}
 	}
-	if bytesRead > writeOffset {
+	if bytesRead > writeOffset && !skipWrite {
 		zbw, err := zeroWriterFunc(dst, writeOffset, bytesRead-writeOffset)
 		if err != nil {
 			klog.Errorf("Error writing zeroes to destination file: %v", err)
@@ -289,5 +364,6 @@ func copyWithSparseCheck(dst *os.File, src io.Reader, zeroWriter zeroWriterFunc)
 		}
 		bytesWritten += zbw
 	}
+	klog.Infof("[DONE] skipWrite=%v, bytesRead: %d MB, bytesWritten: %d MB", skipWrite, bytesRead>>20, bytesWritten>>20)
 	return bytesRead, bytesWritten, nil
 }

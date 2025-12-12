@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl:*)",
+      "Bash(chmod:*)",
+      "Bash(gofmt:*)",
+      "mcp__plugin_claude-mem_claude-mem-search__get_recent_context",
+      "mcp__plugin_claude-mem_claude-mem-search__search",
+      "Bash(kubectl get:*)",
+      "Bash(kubectl logs:*)",
+      "WebFetch(domain:raw.githubusercontent.com)"
+    ]
+  }
+}

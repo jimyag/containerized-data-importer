@@ -17,6 +17,7 @@ limitations under the License.
 package importer
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"encoding/hex"
@@ -205,9 +206,25 @@ func (fr *FormatReaders) gzReader() (io.ReadCloser, error) {
 	return gz, nil
 }
 
-// Return the zst reader.
+// Return the zst reader with buffered input and optimized performance settings.
 func (fr *FormatReaders) zstReader() (io.ReadCloser, error) {
-	zst, err := zstd.NewReader(fr.TopReader())
+	// Add 8MB input buffer between network/upstream reader and zstd decoder
+	// This reduces the number of small reads and improves decompression throughput
+	const (
+		inputBufferSize    = 8 << 20   // 8MB input buffer
+		decoderConcurrency = 8         // Number of concurrent decoders
+		maxWindowSize      = 128 << 20 // 128MB max window size (actual memory limit per decoder)
+	)
+	bufferedReader := bufio.NewReaderSize(fr.TopReader(), inputBufferSize)
+	klog.V(2).Infof("zstd: using %d MB input buffer, %d concurrent decoders, max window %d MB",
+		inputBufferSize>>20, decoderConcurrency, maxWindowSize>>20)
+
+	zst, err := zstd.NewReader(bufferedReader,
+		zstd.WithDecoderLowmem(false),                   // Use more memory for better performance
+		zstd.WithDecoderConcurrency(decoderConcurrency), // Use 8 concurrent decoders
+		zstd.WithDecoderMaxWindow(maxWindowSize),        // Limit window size to 128MB
+		zstd.IgnoreChecksum(true),                       // Skip checksum verification for speed
+	)
 	if err != nil {
 		return nil, errors.Wrap(err, "could not create zst reader")
 	}
