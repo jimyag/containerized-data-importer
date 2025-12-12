@@ -8,7 +8,8 @@
       "mcp__plugin_claude-mem_claude-mem-search__search",
       "Bash(kubectl get:*)",
       "Bash(kubectl logs:*)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:mirror.stream.centos.org)"
     ]
   }
 }

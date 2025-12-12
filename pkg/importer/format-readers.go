@@ -22,6 +22,7 @@ import (
 	"compress/gzip"
 	"encoding/hex"
 	"io"
+	"os/exec"
 	"strconv"
 
 	"github.com/klauspost/compress/zstd"
@@ -206,29 +207,109 @@ func (fr *FormatReaders) gzReader() (io.ReadCloser, error) {
 	return gz, nil
 }
 
-// Return the zst reader with buffered input and optimized performance settings.
-func (fr *FormatReaders) zstReader() (io.ReadCloser, error) {
-	// Add 8MB input buffer between network/upstream reader and zstd decoder
-	// This reduces the number of small reads and improves decompression throughput
+// zstdCmdPath is the path to the system zstd command
+var zstdCmdPath = "/usr/bin/zstd"
+
+// cmdReadCloser wraps a command's stdout with proper cleanup
+type cmdReadCloser struct {
+	io.Reader
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	done   chan error
+}
+
+func (c *cmdReadCloser) Close() error {
+	// Close stdin to signal EOF to zstd
+	if c.stdin != nil {
+		c.stdin.Close()
+	}
+	// Wait for command to finish
+	return <-c.done
+}
+
+// zstReaderCmd creates a zstd reader using the system zstd command (C implementation).
+// This is significantly faster than the pure Go implementation (~1.4 GB/s vs ~300 MB/s).
+func (fr *FormatReaders) zstReaderCmd() (io.ReadCloser, error) {
+	const outputBufferSize = 8 << 20 // 8MB output buffer
+
+	cmd := exec.Command(zstdCmdPath, "-d", "-c")
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, errors.Wrap(err, "could not create stdin pipe for zstd")
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		stdin.Close()
+		return nil, errors.Wrap(err, "could not create stdout pipe for zstd")
+	}
+
+	if err := cmd.Start(); err != nil {
+		stdin.Close()
+		return nil, errors.Wrap(err, "could not start zstd command")
+	}
+
+	klog.V(2).Infof("zstd: using system command %s for decompression", zstdCmdPath)
+
+	// Start goroutine to copy input to zstd stdin
+	done := make(chan error, 1)
+	go func() {
+		_, copyErr := io.Copy(stdin, fr.TopReader())
+		stdin.Close()
+		waitErr := cmd.Wait()
+		if copyErr != nil {
+			done <- copyErr
+		} else {
+			done <- waitErr
+		}
+	}()
+
+	return &cmdReadCloser{
+		Reader: bufio.NewReaderSize(stdout, outputBufferSize),
+		cmd:    cmd,
+		stdin:  stdin,
+		done:   done,
+	}, nil
+}
+
+// zstReaderGo creates a zstd reader using the pure Go implementation.
+// Used as fallback when system zstd is not available.
+func (fr *FormatReaders) zstReaderGo() (io.ReadCloser, error) {
 	const (
 		inputBufferSize    = 8 << 20   // 8MB input buffer
 		decoderConcurrency = 8         // Number of concurrent decoders
-		maxWindowSize      = 128 << 20 // 128MB max window size (actual memory limit per decoder)
+		maxWindowSize      = 128 << 20 // 128MB max window size
 	)
 	bufferedReader := bufio.NewReaderSize(fr.TopReader(), inputBufferSize)
-	klog.V(2).Infof("zstd: using %d MB input buffer, %d concurrent decoders, max window %d MB",
-		inputBufferSize>>20, decoderConcurrency, maxWindowSize>>20)
+	klog.V(2).Infof("zstd: using Go library with %d MB input buffer, %d concurrent decoders",
+		inputBufferSize>>20, decoderConcurrency)
 
 	zst, err := zstd.NewReader(bufferedReader,
-		zstd.WithDecoderLowmem(false),                   // Use more memory for better performance
-		zstd.WithDecoderConcurrency(decoderConcurrency), // Use 8 concurrent decoders
-		zstd.WithDecoderMaxWindow(maxWindowSize),        // Limit window size to 128MB
-		zstd.IgnoreChecksum(true),                       // Skip checksum verification for speed
+		zstd.WithDecoderLowmem(false),
+		zstd.WithDecoderConcurrency(decoderConcurrency),
+		zstd.WithDecoderMaxWindow(maxWindowSize),
+		zstd.IgnoreChecksum(true),
 	)
 	if err != nil {
 		return nil, errors.Wrap(err, "could not create zst reader")
 	}
 	return zst.IOReadCloser(), nil
+}
+
+// zstReader returns a zstd reader, preferring the system command for better performance.
+func (fr *FormatReaders) zstReader() (io.ReadCloser, error) {
+	// Try system zstd command first (C implementation, ~5x faster)
+	if _, err := exec.LookPath(zstdCmdPath); err == nil {
+		reader, err := fr.zstReaderCmd()
+		if err == nil {
+			return reader, nil
+		}
+		klog.V(2).Infof("Failed to use system zstd, falling back to Go implementation: %v", err)
+	}
+
+	// Fallback to Go implementation
+	return fr.zstReaderGo()
 }
 
 // Return the size of the endpoint "through the eye" of the previous reader. Note: there is no

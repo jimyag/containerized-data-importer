@@ -96,6 +96,7 @@ rpmtree(
         "@vim-minimal-2__8.2.2637-21.el9.aarch64//rpm",
         "@xz-libs-0__5.2.5-8.el9.aarch64//rpm",
         "@zlib-0__1.2.11-41.el9.aarch64//rpm",
+        "@zstd-0__1.5.5-1.el9.aarch64//rpm",
     ],
     visibility = ["//visibility:public"],
 )
@@ -190,6 +191,7 @@ rpmtree(
         "@vim-minimal-2__8.2.2637-21.el9.s390x//rpm",
         "@xz-libs-0__5.2.5-8.el9.s390x//rpm",
         "@zlib-0__1.2.11-41.el9.s390x//rpm",
+        "@zstd-0__1.5.5-1.el9.s390x//rpm",
     ],
     visibility = ["//visibility:public"],
 )
@@ -290,6 +292,7 @@ rpmtree(
         "@vim-minimal-2__8.2.2637-21.el9.x86_64//rpm",
         "@xz-libs-0__5.2.5-8.el9.x86_64//rpm",
         "@zlib-0__1.2.11-41.el9.x86_64//rpm",
+        "@zstd-0__1.5.5-1.el9.x86_64//rpm",
     ],
     visibility = ["//visibility:public"],
 )
